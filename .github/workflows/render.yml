@@ -1,0 +1,110 @@
+name: Blender Render
+
+# Renders Blender Cycles frames on GitHub Actions CPU runners.
+# Dispatch by pushing a new jobs.json (the workflow triggers on jobs.json changes).
+# Each job: decode one scene (base64 -> .blend, md5-verified), download Blender
+# 4.2.23, render its frame range, verify the PNGs, zip them and publish as a
+# GitHub Release asset (downloadable without auth for this public repo).
+# Quality lock: Cycles, 1080x1920, 64 samples, OpenImageDenoise, PNG 16-bit RGBA.
+
+on:
+  push:
+    paths:
+      - 'jobs.json'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build matrix from jobs.json
+        id: set-matrix
+        run: |
+          MATRIX=$(python3 -c "import json; print(json.dumps(json.load(open('jobs.json'))['jobs']))")
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  render:
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Decode scene (base64+gzip -> .blend, md5 check)
+        run: |
+          base64 -d "scenes/${{ matrix.job.scene }}.b64.gz" | gunzip > "${{ matrix.job.scene }}"
+          grep " ${{ matrix.job.scene }}$" scenes/checksums.md5 | md5sum -c -
+          ls -la "${{ matrix.job.scene }}"
+
+      - name: Download Blender 4.2.23
+        run: |
+          curl -sL -o blender.tar.xz https://download.blender.org/release/Blender4.2/blender-4.2.23-linux-x64.tar.xz
+          tar -xf blender.tar.xz
+          ./blender-4.2.23-linux-x64/blender --version | grep -q "Blender 4.2.23"
+
+      - name: Render frames
+        env:
+          ENGINE: CYCLES
+          DEVICE: CPU
+          RESX: '1080'
+          RESY: '1920'
+          SAMPLES: '64'
+          NOISE_THRESHOLD: '0.01'
+          MIN_SAMPLES: '32'
+          DENOISE: '1'
+          DEPTH: '16'
+          OUTDIR: ./frames
+          FRAME_START: ${{ matrix.job.frame_start }}
+          FRAME_END: ${{ matrix.job.frame_end }}
+          FRAME_STEP: '1'
+          FORMAT: PNG
+        run: ./blender-4.2.23-linux-x64/blender -b "${{ matrix.job.scene }}" -P kaggle_render_v3.py
+
+      - name: Verify frames (PNG magic, size, 1080x1920 16-bit RGBA)
+        run: |
+          python3 - <<'EOF'
+          import os, glob, struct
+          files = sorted(glob.glob('frames/f*.png'))
+          assert files, 'no frames rendered'
+          bad = []
+          for f in files:
+              with open(f, 'rb') as fh:
+                  data = fh.read(32)
+              if data[:8] != b'\x89PNG\r\n\x1a\n':
+                  bad.append((f, 'bad magic')); continue
+              if os.path.getsize(f) <= 10240:
+                  bad.append((f, 'too small')); continue
+              w, h = struct.unpack('>II', data[16:24])
+              depth = data[24]; ctype = data[25]
+              if (w, h) != (1080, 1920):
+                  bad.append((f, f'bad dims {w}x{h}')); continue
+              if depth != 16 or ctype != 6:
+                  bad.append((f, f'bad depth/ctype {depth}/{ctype}')); continue
+          assert not bad, f'verification failed: {bad}'
+          print(f'VERIFIED {len(files)} frames OK (1080x1920 16-bit RGBA)')
+          EOF
+
+      - name: Zip and publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ matrix.job.tag }}"
+          cd frames && zip -q "../${TAG}.zip" f*.png render_log.csv && cd ..
+          ls -la "${TAG}.zip"
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${TAG}.zip" --clobber
+          else
+            gh release create "${TAG}" "${TAG}.zip" --title "${TAG}" --notes "Blender render ${{ matrix.job.scene }} frames ${{ matrix.job.frame_start }}-${{ matrix.job.frame_end }} (Cycles 1080x1920 64sp CPU)"
+          fi
